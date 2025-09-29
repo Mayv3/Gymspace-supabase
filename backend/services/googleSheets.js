@@ -1,0 +1,1449 @@
+import { google } from 'googleapis';
+import dotenv from 'dotenv';
+import dayjs from 'dayjs';
+import timezone from "dayjs/plugin/timezone.js";
+import utc from "dayjs/plugin/utc.js";
+import supabase from '../db/supabase.js';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dotenv.config();
+
+const auth = new google.auth.GoogleAuth({
+  credentials: {
+    type: 'service_account',
+    project_id: process.env.GOOGLE_PROJECT_ID,
+    private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
+    private_key: process.env.GOOGLE_PRIVATE_KEY,
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    auth_uri: process.env.GOOGLE_AUTH_URI,
+    token_uri: process.env.GOOGLE_TOKEN_URI,
+    auth_provider_x509_cert_url: process.env.GOOGLE_AUTH_PROVIDER_CERT_URL,
+    client_x509_cert_url: process.env.GOOGLE_CLIENT_CERT_URL,
+  },
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+});
+
+const sheets = google.sheets({ version: 'v4', auth });
+
+async function getNextId(range) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range,
+  });
+  const existingIds = (res.data.values ?? [])
+    .flat()
+    .map(id => parseInt(id, 10))
+    .filter(n => !isNaN(n));
+  return (existingIds.length ? Math.max(...existingIds) : 0) + 1;
+}
+
+// ================== ALUMNOS ==================
+
+export async function getAlumnosFromSheet() {
+  const { data, error } = await supabase
+    .from('alumnos')
+    .select('*')
+    .is('deleted_at', null)
+    .order('nombre');
+
+  if (error) throw error;
+
+  return data.map((alumno) => ({
+    ID: alumno.id,
+    DNI: alumno.dni,
+    Nombre: alumno.nombre,
+    Email: alumno.email,
+    Telefono: alumno.telefono,
+    Sexo: alumno.sexo,
+    Fecha_nacimiento: alumno.fecha_nacimiento
+      ? dayjs(alumno.fecha_nacimiento).format('DD/MM/YYYY')
+      : null,
+    Plan: alumno.plan,
+    Clases_pagadas: alumno.clases_pagadas,
+    Clases_realizadas: alumno.clases_realizadas,
+    Fecha_inicio: alumno.fecha_inicio
+      ? dayjs(alumno.fecha_inicio).format('DD/MM/YYYY')
+      : null,
+    Fecha_vencimiento: alumno.fecha_vencimiento
+      ? dayjs(alumno.fecha_vencimiento).format('DD/MM/YYYY')
+      : null,
+    Profesor_asignado: alumno.profesor_asignado,
+    GymCoins: alumno.gymcoins,
+  }));
+}
+
+function toISODate(dateStr) {
+  if (!dateStr) return null;
+  if (dateStr.includes("/")) {
+    // viene como dd/mm/yyyy
+    const [day, month, year] = dateStr.split("/");
+    return `${year}-${month}-${day}`;
+  }
+  return dateStr; // ya en formato correcto
+}
+
+// Insertar alumno
+export async function appendAlumnoToSheet(alumno) {
+  const { data: existing, error: checkError } = await supabase
+    .from("alumnos")
+    .select("dni")
+    .eq("dni", alumno.DNI)
+    .maybeSingle();
+
+  if (checkError) throw checkError;
+  if (existing) throw new Error("El DNI ya está registrado");
+
+  const { data, error } = await supabase
+    .from("alumnos")
+    .insert([
+      {
+        dni: alumno.DNI || "",
+        nombre: alumno["Nombre"] || "",
+        email: alumno.Email || "",
+        telefono: alumno.Telefono || "",
+        sexo: alumno.Sexo || "",
+        fecha_nacimiento: toISODate(alumno["Fecha_nacimiento"]),
+        plan: alumno.Plan || null,
+        clases_pagadas: alumno["Clases_pagadas"] || 0,
+        clases_realizadas: alumno["Clases_realizadas"] || 0,
+        fecha_inicio: toISODate(alumno["Fecha_inicio"]),
+        fecha_vencimiento: toISODate(alumno["Fecha_vencimiento"]),
+        profesor_asignado: alumno["Profesor_asignado"] || "",
+        gymcoins: alumno["GymCoins"] || 0,
+      },
+    ])
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+
+// Actualizar alumno por DNI
+export async function updateAlumnoByDNI(dni, nuevosDatos) {
+  const { data, error } = await supabase
+    .from('alumnos')
+    .update(nuevosDatos)
+    .eq('dni', dni)
+    .select()
+    .single();
+
+  if (error) {
+    if (error.code === 'PGRST116') return false; // no encontrado
+    throw error;
+  }
+
+  return data ? true : false;
+}
+
+// Eliminar alumno por DNI (soft delete)
+export async function deleteAlumnoByDNI(dni) {
+  const { data, error } = await supabase
+    .from('alumnos')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('dni', dni)
+    .select()
+    .single();
+
+  if (error) {
+    if (error.code === 'PGRST116') return false; // no encontrado
+    throw error;
+  }
+
+  return data ? true : false;
+}
+
+// Reiniciar puntos (GymCoins = 0)
+
+export async function reiniciarPuntosAlumnos() {
+  try {
+    console.log('🔄 Iniciando reinicio de puntos...');
+
+    const { error } = await supabase
+      .from('alumnos')
+      .update({ gymcoins: 0 })
+      .is('deleted_at', null);
+
+    if (error) throw error;
+
+    console.log('✅ Puntos reiniciados para todos los alumnos');
+    return true;
+  } catch (error) {
+    console.error('❌ Error al reiniciar puntos:', error);
+    throw error;
+  }
+}
+
+// Pagos
+
+export async function getPagosFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Pagos!A1:L',
+  });
+
+  const [headers, ...rows] = res.data.values;
+
+  const pagos = rows.map((row) => {
+    const pago = {};
+    headers.forEach((header, i) => {
+      pago[header] = row[i] || '';
+    });
+    return pago;
+  });
+
+  return pagos;
+}
+
+export async function appendPagoToSheet(pago) {
+  const nuevoID = await getNextId('Pagos!A2:A');
+
+  const horaActual = new Date().toLocaleTimeString("es-AR", {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+
+  pago.Hora = horaActual;
+
+  const values = [[
+    String(nuevoID),
+    pago['Socio DNI'] || '',
+    pago.Nombre || '',
+    pago.Monto || '',
+    pago['Método de Pago'] || '',
+    pago['Fecha de Pago'] || '',
+    pago['Fecha de Vencimiento'] || '',
+    pago.Responsable || '',
+    pago.Turno || '',
+    pago.Hora || '',
+    pago['Tipo'] || '',
+    pago['Ultimo_Plan'] || ''
+  ]];
+
+  sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Pagos!A1:L1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+
+  const planes = await getPlanesFromSheet();
+  const plan = planes.find(p => p['Plan o Producto'] === pago['Ultimo_Plan']);
+  const coins = plan ? Number(plan.Coins) || 0 : 0;
+
+  if (coins > 0) {
+    await appendRegistroPuntoToSheet({
+      DNI: pago['Socio DNI'],
+      Nombre: pago.Nombre,
+      Puntos: coins,
+      Motivo: `Pago del plan ${pago['Ultimo_Plan']}`,
+      Responsable: pago.Responsable,
+      PagoID: String(nuevoID)
+    });
+  }
+
+  return { id: nuevoID, ...pago };
+}
+
+export async function updatePagoByID(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Pagos!A1:H',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const nuevaFila = headers.map((header, i) => nuevosDatos[header] || rows[rowIndex][i]);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `Pagos!A${rowIndex + 2}:H${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] },
+  });
+
+  return true;
+}
+
+export async function deletePagoByID(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Pagos!A1:L',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const pago = rows[rowIndex];
+  const dniAlumno = pago[1];
+  const planNombre = pago[11];
+
+  // --- Eliminar pago ---
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 1211942960,
+              dimension: 'ROWS',
+              startIndex: rowIndex + 1,
+              endIndex: rowIndex + 2
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  // --- Eliminar en RegistroPuntos si tiene PagoID ---
+  const puntosRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "RegistroPuntos!A1:H",
+  });
+
+  const [headersPuntos, ...rowsPuntos] = puntosRes.data.values || [];
+  const pagoIdIndex = headersPuntos.indexOf("PagoID");
+
+  if (pagoIdIndex !== -1) {
+    const rowIndexPuntos = rowsPuntos.findIndex((r) => r[pagoIdIndex] === id);
+    if (rowIndexPuntos !== -1) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        requestBody: {
+          requests: [
+            {
+              deleteDimension: {
+                range: {
+                  sheetId: 784450678,
+                  dimension: "ROWS",
+                  startIndex: rowIndexPuntos + 1,
+                  endIndex: rowIndexPuntos + 2,
+                },
+              },
+            },
+          ],
+        },
+      });
+    }
+  }
+
+
+  // --- Buscar puntos del plan y restar al alumno ---
+  const planes = await getPlanesFromSheet();
+  const plan = planes.find(p => p["Plan o Producto"] === planNombre);
+  const puntosARestar = plan ? Number(plan.Coins) : 0;
+
+  if (puntosARestar > 0 && dniAlumno) {
+    const alumnosRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: "Alumnos!A1:O",
+    });
+
+    const [headersAlumnos, ...rowsAlumnos] = alumnosRes.data.values;
+    const dniIndex = headersAlumnos.indexOf("DNI");
+    const coinsIndex = headersAlumnos.indexOf("GymCoins");
+
+    const alumnoRowIndex = rowsAlumnos.findIndex(r => r[dniIndex] === dniAlumno);
+
+    if (alumnoRowIndex !== -1) {
+      const alumno = rowsAlumnos[alumnoRowIndex];
+      const coinsActuales = Number(alumno[coinsIndex] || 0);
+      const nuevoTotal = Math.max(coinsActuales - puntosARestar, 0);
+
+      const rowNumber = alumnoRowIndex + 2;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        range: `Alumnos!${String.fromCharCode(65 + coinsIndex)}${rowNumber}`,
+        valueInputOption: "RAW",
+        requestBody: {
+          values: [[nuevoTotal]]
+        }
+      });
+    }
+  }
+
+  return true;
+}
+
+
+// Roles 
+
+export async function getRolesFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Roles!A1:C', // Asegurate que el nombre de la hoja sea correcto
+  });
+
+  const [headers, ...rows] = res.data.values;
+
+  const roles = rows.map((row) => {
+    const user = {};
+    headers.forEach((header, i) => {
+      user[header] = row[i] || '';
+    });
+    return user;
+  });
+
+  return roles;
+}
+
+// Asistencias 
+
+export async function appendAsistenciaToSheet(asistencia) {
+  const nuevoID = await getNextId('Asistencias!A2:A');
+
+  const values = [[
+    String(nuevoID),
+    asistencia.Fecha,
+    asistencia.Hora,
+    asistencia.DNI,
+    asistencia.Nombre,
+    asistencia.Plan,
+    asistencia.Responsable
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Asistencias!A1:G1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+
+  await appendRegistroPuntoToSheet({
+    DNI: asistencia.DNI,
+    Nombre: asistencia.Nombre,
+    Puntos: 25,
+    Motivo: "Asistencia registrada",
+    Responsable: asistencia.Responsable
+  });
+}
+
+export async function getAsistenciasFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Asistencias!A1:G',
+  });
+
+  const [headers, ...rows] = res.data.values;
+
+  const asistencias = rows.map((row) => {
+    const obj = {};
+    headers.forEach((header, i) => {
+      obj[header] = row[i] || '';
+    });
+    return obj;
+  });
+
+  return asistencias;
+}
+
+export async function getAllAsistenciasService() {
+  const asistencias = await getAsistenciasFromSheet();
+  return asistencias;
+}
+
+export async function getAsistenciasHoyService() {
+  const asistencias = await getAsistenciasFromSheet();
+
+  const hoyArg = dayjs().tz("America/Argentina/Buenos_Aires").format("D/M/YYYY");
+
+  const asistenciasHoy = asistencias.filter(a => a.Fecha === hoyArg);
+
+  return asistenciasHoy;
+}
+
+// Clases diarias 
+
+export async function appendClaseDiariaToSheet(clase) {
+  const nuevoID = await getNextId('ClasesDiarias!A2:A');
+
+  const values = [[
+    String(nuevoID),
+    clase.Fecha,
+    clase.Tipo,
+    String(clase.Cantidad),
+    clase.Responsable
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'ClasesDiarias!A1:E1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+}
+
+export async function updateClaseDiariaByID(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'ClasesDiarias!A1:E',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const nuevaFila = headers.map((header, i) => nuevosDatos[header] || rows[rowIndex][i]);
+
+  sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `ClasesDiarias!A${rowIndex + 2}:E${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] },
+  });
+
+  return true;
+}
+
+export async function deleteClaseDiariaByID(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'ClasesDiarias!A1:E',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 801252478,
+              dimension: 'ROWS',
+              startIndex: rowIndex + 1,
+              endIndex: rowIndex + 2
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+export async function getClasesDiariasFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'ClasesDiarias!A1:E',
+  });
+
+  const [headers, ...rows] = res.data.values;
+
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = row[i] || '';
+    });
+    return obj;
+  });
+}
+
+// Caja
+
+export async function appendCajaToSheet(caja) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Caja!A2:A',
+  });
+
+  const nuevoID = await getNextId('Caja!A2:A');
+
+  const values = [[
+    String(nuevoID),
+    caja.Fecha,
+    caja.Turno,
+    caja['Hora Apertura'],
+    caja['Saldo Inicial'],
+    caja['Total Efectivo'],
+    caja['Total Tarjeta'],
+    caja['Total Final'],
+    caja.Responsable,
+    caja['Hora Cierre']
+  ]];
+
+  sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Caja!A1:J1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+
+  return { id: values[0][0], message: 'Caja añadida correctamente' };
+}
+
+export async function updateCajaByID(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Caja!A1:J',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  if (nuevosDatos['Saldo Inicial'] !== undefined) {
+    rows[rowIndex][headers.indexOf('Saldo Inicial')] = nuevosDatos['Saldo Inicial']
+  }
+
+  if (
+    nuevosDatos['Total Efectivo'] !== undefined &&
+    nuevosDatos['Total Tarjeta'] !== undefined
+  ) {
+    const efectivo = parseFloat(nuevosDatos['Total Efectivo']) || 0
+    const tarjeta = parseFloat(nuevosDatos['Total Tarjeta']) || 0
+
+    const saldoInicialStr = rows[rowIndex][headers.indexOf('Saldo Inicial')] || '0'
+    const saldoInicial = parseFloat(saldoInicialStr) || 0
+
+    nuevosDatos['Total Final'] = (saldoInicial + efectivo + tarjeta).toString()
+  }
+
+  const nuevaFila = headers.map((header, i) => nuevosDatos[header] || rows[rowIndex][i]);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `Caja!A${rowIndex + 2}:J${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] },
+  });
+
+  return true;
+}
+
+export async function deleteCajaByID(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Caja!A1:J',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 404044225,
+              dimension: 'ROWS',
+              startIndex: rowIndex + 1,
+              endIndex: rowIndex + 2
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+export async function getCajasFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Caja!A1:J',
+  });
+
+  const [headers, ...rows] = res.data.values;
+
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = row[i] || '';
+    });
+    return obj;
+  });
+}
+
+// Planes 
+
+export async function getPlanesFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'PlanesYprecios!A1:F',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = row[i] || '');
+    return obj;
+  });
+}
+
+export async function appendPlanToSheet(data) {
+  const nuevoID = await getNextId('PlanesYprecios!A2:A');
+
+  const values = [[
+    nuevoID,
+    data.Tipo,
+    data['Plan o Producto'],
+    data.Precio,
+    data.numero_Clases,
+    data.Coins
+  ]]
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'PlanesYprecios!A:F',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values }
+  })
+
+  return {
+    ID: nuevoID,
+    Tipo: data.Tipo,
+    'Plan o Producto': data['Plan o Producto'],
+    Precio: data.Precio,
+    numero_Clases: data.numero_Clases,
+    Coins: data.Coins
+  }
+}
+
+export async function updatePlanInSheet(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'PlanesYprecios!A1:F',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+  if (rowIndex === -1) return false;
+
+  const nuevaFila = headers.map((header, i) => {
+    return nuevosDatos[header] ?? rows[rowIndex][i] ?? '';
+  });
+
+  sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `PlanesYprecios!A${rowIndex + 2}:F${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] }
+  });
+
+  return true;
+}
+
+export async function deletePlanInSheet(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'PlanesYprecios!A1:F',
+  });
+
+  const rows = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 222062821,
+              dimension: 'ROWS',
+              startIndex: rowIndex,
+              endIndex: rowIndex + 1
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+export const appendAumentoToSheet = async ({
+  Fecha,
+  Precio_anterior,
+  Precio_actualiza,
+  Porcentaje_aumento,
+  Plan
+}) => {
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Aumentos_planes!A:F',
+    valueInputOption: 'RAW',
+    resource: {
+      values: [
+        [Fecha, Precio_anterior, Precio_actualiza, Porcentaje_aumento, Plan]
+      ]
+    }
+  });
+};
+
+export const getAumentosPlanesFromSheet = async () => {
+
+  const sheets = google.sheets({ version: 'v4', auth });
+  const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+
+  const range = 'Aumentos_planes!A:F';
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range,
+  });
+
+  const rows = response.data.values;
+
+  if (!rows || rows.length === 0) return [];
+
+  const headers = rows[0];
+  const data = rows.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((header, index) => {
+      obj[header] = row[index] || '';
+    });
+    return obj;
+  });
+
+  return data;
+};
+
+
+// Anotaciones
+
+export async function getAnotacionesFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Anotaciones!A1:F1000',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = row[i] || '');
+    return obj;
+  });
+}
+
+export async function appendAnotacionToSheet(data) {
+  const registros = await getAnotacionesFromSheet();
+  const nuevoID = String((registros.length || 0) + 1);
+
+  const values = [[
+    nuevoID,
+    data.Fecha,
+    data.Hora,
+    data['Alumno DNI'],
+    data.Nota,
+    data.ProfeaCargo
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Anotaciones!A1:F1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values }
+  });
+}
+
+export async function updateAnotacionInSheet(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Anotaciones!A1:F',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+  if (rowIndex === -1) return false;
+
+  const nuevaFila = headers.map((h, i) => nuevosDatos[h] || rows[rowIndex][i]);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `Anotaciones!A${rowIndex + 2}:F${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] }
+  });
+
+  return true;
+}
+
+export async function deleteAnotacionInSheet(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Anotaciones!A1:F',
+  });
+
+  const rows = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+  if (rowIndex === -1) return false;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 1095798724,
+              dimension: 'ROWS',
+              startIndex: rowIndex,
+              endIndex: rowIndex + 1
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+// Clases del Club
+
+export async function getClasesElClubFromSheet() {
+  const alumnos = await getAlumnosFromSheet();
+  const alumnosMap = alumnos.reduce((map, alumno) => {
+    map[alumno.DNI] = alumno.Nombre;
+    return map;
+  }, {});
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'ClasesElClub!A1:F',
+  });
+  const [headers, ...rows] = res.data.values;
+  if (!headers || !rows) {
+    throw new Error('No se encontraron datos en la hoja de Clases del Club.');
+  }
+
+  const inscriptosIdx = headers.findIndex(h => h === 'Inscriptos');
+
+  return rows.map(row => {
+    const clase = headers.reduce((obj, header, i) => {
+      obj[header] = row[i] || '';
+      return obj;
+    }, {});
+
+    const dniList = (clase.Inscriptos || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    const nombreList = dniList.map(dni =>
+      alumnosMap[dni] || `(DNI ${dni} no encontrado)`
+    );
+
+    clase.InscriptosNombres = nombreList.join(', ');
+
+    return clase;
+  });
+}
+
+
+export async function updateClaseElClubInSheet(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'ClasesElClub!A1:F',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const actual = rows[rowIndex];
+
+  const nuevaFila = headers.map((header, i) =>
+    nuevosDatos[header] !== undefined ? nuevosDatos[header] : actual[i]
+  );
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `ClasesElClub!A${rowIndex + 2}:F${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] },
+  });
+
+  return true;
+}
+
+export async function appendToRegistrosClasesSheet(registro) {
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const values = [[
+    registro.IDClase,
+    registro['Nombre de clase'],
+    registro.Fecha,
+    registro.Hora,
+    registro['DNI Alumno'],
+    registro['Nombre Alumno']
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'RegistrosClasesElClub!A1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: {
+      values
+    }
+  });
+}
+
+export async function eliminarRegistroDeClase({ IDClase, DNI, Fecha }) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'RegistrosClasesElClub!A1:F',
+  });
+
+  const [headers, ...rows] = res.data.values;
+  const idIndex = headers.indexOf('ID');
+  const dniIndex = headers.indexOf('DNI Alumno');
+  const fechaIndex = headers.indexOf('Fecha');
+
+  const rowIndex = rows.findIndex(row =>
+    String(row[idIndex]) === String(IDClase) &&
+    String(row[dniIndex]) === String(DNI) &&
+    dayjs(row[fechaIndex], ['D/M/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD']).format('D/M/YYYY') ===
+    dayjs(Fecha, ['D/M/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD']).format('D/M/YYYY')
+  );
+
+  if (rowIndex === -1) {
+    console.log("❌ No se encontró el registro a eliminar");
+    return false;
+  }
+
+  console.log("✅ Eliminando fila:", rowIndex + 2);
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 1279938571,
+              dimension: 'ROWS',
+              startIndex: rowIndex + 1,
+              endIndex: rowIndex + 2
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+// Turnos
+
+export async function getTurnosFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Turnos!A1:G',
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+
+  return rows.map(row => {
+    const turno = {};
+    headers.forEach((h, i) => {
+      turno[h] = row[i] || '';
+    });
+    return turno;
+  });
+}
+
+export async function appendTurnoToSheet(turno) {
+  const nuevoID = await getNextId('Turnos!A2:A');
+
+  const turnoConID = {
+    ID: String(nuevoID),
+    ...turno
+  };
+
+  const values = [[
+    turnoConID.ID,
+    turnoConID.Fecha,
+    turnoConID.Tipo,
+    turnoConID.Fecha_turno,
+    turnoConID.Profesional,
+    turnoConID.Responsable,
+    turnoConID.Hora
+  ]];
+  console.log(values)
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Turnos!A1:G1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+
+  return turnoConID;
+}
+
+export async function updateTurnoByID(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Turnos!A1:G',
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const actual = rows[rowIndex];
+
+  const nuevaFila = headers.map((header, i) =>
+    nuevosDatos[header] !== undefined ? nuevosDatos[header] : actual[i]
+  );
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `Turnos!A${rowIndex + 2}:G${rowIndex + 2}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [nuevaFila] },
+  });
+
+  return true;
+}
+
+export async function deleteTurnoByID(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Turnos!A1:G',
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const sheetRowIndex = rowIndex + 1 + 1;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 1421664716,
+              dimension: 'ROWS',
+              startIndex: sheetRowIndex - 1,
+              endIndex: sheetRowIndex
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+// Egresos
+
+export async function getEgresosFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Egresos!A1:F',
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = row[i] || '');
+    return obj;
+  });
+}
+
+export async function appendEgresoToSheet(data) {
+  const nuevoID = await getNextId('Egresos!A2:A');
+
+  const values = [[
+    String(nuevoID),
+    data.Fecha || '',
+    data.Motivo || '',
+    data.Monto || '',
+    data.Responsable || '',
+    data.Tipo || ''
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Egresos!A1:F1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+
+  return { id: nuevoID, ...data };
+}
+
+export async function deleteEgresoByID(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'Egresos!A1:E',
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 590711251,
+              dimension: 'ROWS',
+              startIndex: rowIndex + 1,
+              endIndex: rowIndex + 2
+            }
+          }
+        }
+      ]
+    }
+  });
+
+  return true;
+}
+
+export async function getEgresosByMesYAnio(anio, mes) {
+  const todos = await getEgresosFromSheet()
+
+  return todos.filter(e => {
+    const fecha = dayjs(e.Fecha, ["D/M/YYYY", "DD/MM/YYYY", "YYYY-MM-DD"], true)
+    return fecha.isValid() && fecha.month() + 1 === mes && fecha.year() === anio
+  })
+}
+
+// Deudas
+
+export async function getDeudasFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "Deudas!A1:I",
+  })
+
+  const [headers, ...rows] = res.data.values || []
+  return rows.map((row) => {
+    const deuda = {}
+    headers.forEach((h, i) => {
+      deuda[h] = row[i] || ""
+    })
+    return deuda
+  })
+}
+
+export async function appendDeudaToSheet(deuda) {
+  const nuevoID = await getNextId("Deudas!A2:A")
+
+  const deudaConID = {
+    ID: String(nuevoID),
+    ...deuda,
+  }
+
+  const values = [[
+    deudaConID.ID,
+    deudaConID.DNI,
+    deudaConID.Nombre,
+    deudaConID.Tipo,
+    deudaConID.Monto,
+    deudaConID.Motivo,
+    deudaConID.Fecha,
+    deudaConID.Estado,
+    deudaConID.Responsable
+  ]]
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "Deudas!A1:I1",
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    resource: { values },
+  })
+
+  return deudaConID
+}
+
+export async function updateDeudaByID(id, nuevosDatos) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "Deudas!A1:I",
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const actual = rows[rowIndex];
+
+  const nuevaFila = headers.map((header, i) =>
+    nuevosDatos[header] !== undefined ? nuevosDatos[header] : actual[i]
+  );
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `Deudas!A${rowIndex + 2}:I${rowIndex + 2}`,
+    valueInputOption: "USER_ENTERED",
+    resource: { values: [nuevaFila] },
+  });
+
+  return true;
+}
+
+export async function deleteDeudaByID(id) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "Deudas!A1:I",
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+  const rowIndex = rows.findIndex(row => row[0] === id);
+
+  if (rowIndex === -1) return false;
+
+  const sheetRowIndex = rowIndex + 2;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: 1774869975,
+              dimension: "ROWS",
+              startIndex: sheetRowIndex - 1,
+              endIndex: sheetRowIndex,
+            },
+          },
+        },
+      ],
+    },
+  });
+
+  return true;
+}
+
+// Puntos
+
+export async function getRegistroPuntosFromSheet() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'RegistroPuntos!A1:H',
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = row[i] || '';
+    });
+    return obj;
+  });
+}
+
+export async function appendRegistroPuntoToSheet(data) {
+  const nuevoID = await getNextId('RegistroPuntos!A2:A');
+
+  const values = [[
+    String(nuevoID),
+    data.DNI || '',
+    data.Nombre || '',
+    dayjs().format("YYYY-MM-DD"),
+    data.Puntos || '0',
+    data.Motivo || '',
+    data.Responsable || '',
+    data.PagoID || ''
+  ]];
+
+  sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: 'RegistroPuntos!A1:H1',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    resource: { values },
+  });
+
+  return { id: nuevoID, ...data };
+}
+
+export async function getHistorialPuntosByDNI(dni) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "RegistroPuntos!A1:H",
+  });
+
+  const [headers, ...rows] = res.data.values || [];
+
+  const registros = rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = row[i] || "";
+    });
+    return obj;
+  });
+
+  const now = dayjs();
+  const currentMonth = now.month();
+  const currentYear = now.year();
+
+  const filtrados = registros.filter(r => {
+    if (r.DNI !== dni) return false;
+
+    const fecha = dayjs(r.Fecha, [
+      "YYYY-MM-DD HH:mm",
+      "YYYY-MM-DD",
+      "DD/MM/YYYY",
+      "D/M/YYYY",
+    ], true);
+
+    return (
+      fecha.isValid() &&
+      fecha.month() === currentMonth &&
+      fecha.year() === currentYear
+    );
+  });
+
+  return filtrados.reverse();
+}
