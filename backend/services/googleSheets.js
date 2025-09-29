@@ -97,8 +97,6 @@ export async function getAlumnosFromSheet() {
   }));
 }
 
-
-
 // Insertar alumno
 export async function appendAlumnoToSheet(alumno) {
   const { data: existing, error: checkError } = await supabase
@@ -906,7 +904,6 @@ export async function getEgresosByMesYAnio(anio, mes) {
     Tipo: e.tipo || "",
   }))
 }
-
 
 // Asistencias 
 

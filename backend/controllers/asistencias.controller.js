@@ -3,7 +3,6 @@ import {
   getAsistenciasFromSheet,
   appendAsistenciaToSheet,
   updateAlumnoByDNI,
-  getClasesElClubFromSheet,
   getPlanesFromSheet
 } from '../services/googleSheets.js';
 import dayjs from 'dayjs';
@@ -13,6 +12,7 @@ import utc from 'dayjs/plugin/utc.js';
 import timezone from 'dayjs/plugin/timezone.js';
 import weekOfYear from 'dayjs/plugin/weekOfYear.js'
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
+import supabase from '../db/supabase.js';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -24,118 +24,30 @@ dayjs.extend(customParseFormat);
 const PLANES_ILIMITADOS = ['Pase libre', 'Personalizado premium', 'Libre', 'Personalizado gold'];
 
 export const registrarAsistencia = async (req, res) => {
+  console.time("⏱️ registrarAsistencia - total"); // mide todo el endpoint
   try {
-    const tz = "America/Argentina/Cordoba";
     const { dni } = req.body;
-    if (!dni) return res.status(400).json({ message: 'DNI es requerido' });
-
-    // Buscar alumno
-    const alumnos = await getAlumnosFromSheet();
-    const alumno = alumnos.find(a => String(a.DNI) === String(dni));
-    if (!alumno) return res.status(404).json({ message: 'Alumno no encontrado' });
-
-    // Parsear vencimiento en la MISMA TZ
-    const vencimiento = dayjs.tz(
-      alumno['Fecha_vencimiento'],
-      ['D/M/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD'],
-      tz
-    );
-    if (!vencimiento.isValid()) {
-      return res.status(400).json({ message: 'Fecha de vencimiento inválida' });
+    if (!dni) {
+      console.timeEnd("⏱️ registrarAsistencia - total");
+      return res.status(400).json({ message: "DNI es requerido" });
     }
 
-    const ahora = dayjs().tz(tz);
+    console.time("⏱️ registrarAsistencia - rpc"); // mide solo el RPC
+    const { data, error } = await supabase
+      .rpc("registrar_asistencia", { p_dni: dni });
+    console.timeEnd("⏱️ registrarAsistencia - rpc");
 
-    // ✅ Regla: vence a las 00:00 del día indicado (ese día ya está vencido)
-    const vencio = !ahora.isBefore(vencimiento.startOf('day'));
-    if (vencio) {
-      return res.status(403).json({
-        message: `El plan de ${alumno.Nombre} venció el ${vencimiento.format('DD/MM/YYYY')}`,
-        fechaVencimiento: vencimiento.format('DD/MM/YYYY'),
-      });
-    }
+    if (error) throw error;
 
-    // Formatos para registrar/chequear asistencia
-    const hoy = ahora.format('DD-MM-YYYY');
-    const hora = ahora.format('HH:mm');
-
-    // Traer asistencias y normalizar fechas a DD-MM-YYYY (misma TZ)
-    const asistencias = await getAsistenciasFromSheet();
-    const asistenciasFormateadas = asistencias.map(a => {
-      const f = dayjs.tz(a.Fecha, ['D/M/YYYY', 'DD/MM/YYYY', 'DD-MM-YYYY', 'YYYY-MM-DD'], tz);
-      return { ...a, Fecha: f.isValid() ? f.format('DD-MM-YYYY') : String(a.Fecha) };
-    });
-
-    // Evitar doble marca el mismo día
-    const yaAsistioHoy = asistenciasFormateadas.some(
-      a => String(a.DNI) === String(dni) && a.Fecha === hoy
-    );
-    if (yaAsistioHoy) {
-      return res.status(409).json({ message: `El alumno ${alumno.Nombre} ya registró asistencia hoy` });
-    }
-
-    // Chequeo de clases antes de escribir
-    const plan = alumno.Plan;
-    const esIlimitado = PLANES_ILIMITADOS.includes(plan);
-    const pagadas = Number(alumno['Clases_pagadas']) || 0;
-    const realizadasActual = Number(alumno['Clases_realizadas']) || 0;
-
-    if (!esIlimitado && realizadasActual >= pagadas) {
-      return res.status(409).json({
-        message: `El alumno ${alumno.Nombre} ya agotó sus clases pagadas`,
-        plan,
-        clasesPagadas: pagadas,
-        clasesRealizadas: realizadasActual,
-        gymCoins: Number(alumno['GymCoins']) || 0,
-        fechaVencimiento: vencimiento.format('DD/MM/YYYY')
-      });
-    }
-
-    // Registrar asistencia
-    const nuevaAsistencia = {
-      Fecha: hoy,
-      Hora: hora,
-      DNI: String(alumno.DNI),
-      Nombre: alumno.Nombre,
-      Plan: alumno.Plan,
-      Responsable: ''
-    };
-    await appendAsistenciaToSheet(nuevaAsistencia);
-
-    // Actualizar alumno: +1 clase y +25 GymCoins
-    const gymCoinsActuales = Number(alumno['GymCoins']) || 0;
-    const realizadas = realizadasActual + 1;
-    const gymCoinsActualizadas = gymCoinsActuales + 25;
-
-    await updateAlumnoByDNI(String(dni), {
-      'Clases_realizadas': String(realizadas),
-      'GymCoins': String(gymCoinsActualizadas),
-    });
-
-    // Emitir eventos (si existe socket)
-    const io = req.app.get('socketio');
-    io?.emit('asistencia-registrada', { dni: String(dni), nuevaAsistencia });
-    io?.emit('asistencia-actualizada', {
-      dni: String(dni),
-      clasesRealizadas: realizadas,
-      gymCoins: gymCoinsActualizadas
-    });
-
-    return res.status(201).json({
-      message: 'Asistencia registrada correctamente',
-      nombre: alumno.Nombre,
-      plan,
-      clasesPagadas: pagadas,
-      clasesRealizadas: realizadas,
-      gymCoins: gymCoinsActualizadas,
-      fechaVencimiento: vencimiento.format('DD/MM/YYYY')
-    });
-
-  } catch (error) {
-    console.error('Error al registrar asistencia:', error);
-    return res.status(500).json({ message: 'Error al registrar la asistencia' });
+    console.timeEnd("⏱️ registrarAsistencia - total");
+    return res.status(data.status).json(data);
+  } catch (err) {
+    console.timeEnd("⏱️ registrarAsistencia - total");
+    console.error("Error RPC registrar_asistencia:", err);
+    return res.status(500).json({ message: "Error al registrar asistencia" });
   }
 };
+
 
 export const verificarAlumno = async (req, res) => {
   const start = Date.now();
@@ -198,8 +110,6 @@ export const verificarAlumno = async (req, res) => {
       });
     }
 
-    const elapsed = Date.now() - start;
-    console.log(`✅ Alumno activo:`, data, `⏱️ ${elapsed}ms`);
     return res.status(200).json({
       message: "Alumno activo",
       ...data,

@@ -1,5 +1,4 @@
 import {
-  appendCajaToSheet,
   updateCajaByID,
   deleteCajaByID,
   getCajasFromSheet,
