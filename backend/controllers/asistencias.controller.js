@@ -137,8 +137,6 @@ export const registrarAsistencia = async (req, res) => {
   }
 };
 
-
-
 export const verificarAlumno = async (req, res) => {
   const start = Date.now();
   const tz = "America/Argentina/Cordoba";
@@ -212,7 +210,6 @@ export const verificarAlumno = async (req, res) => {
   }
 };
 
-
 export const getAsistenciasPorDNI = async (req, res) => {
   try {
     const dni = req.params.dni;
@@ -270,7 +267,6 @@ export const getAsistenciasPorHora = async (req, res) => {
     res.status(500).json({ message: "Error interno del servidor" });
   }
 };
-
 
 export const getPromediosRangosHorarios = async (req, res) => {
   try {
